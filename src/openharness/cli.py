@@ -2408,6 +2408,32 @@ def main(
                 print(f"Session not found: {resume}", file=sys.stderr)
                 raise typer.Exit(1)
 
+        # If --print mode is also specified, use print mode with restored messages
+        if print_mode is not None:
+            prompt = print_mode.strip()
+            if not prompt:
+                print("Error: -p/--print requires a prompt value, e.g. -p 'your prompt'", file=sys.stderr)
+                raise typer.Exit(1)
+            asyncio.run(
+                run_print_mode(
+                    prompt=prompt,
+                    output_format=output_format or "text",
+                    cwd=cwd,
+                    model=session_data.get("model") or model,
+                    base_url=base_url,
+                    system_prompt=system_prompt,
+                    append_system_prompt=append_system_prompt,
+                    api_key=api_key,
+                    api_format=api_format,
+                    permission_mode=permission_mode,
+                    max_turns=max_turns,
+                    effort=effort,
+                    restore_messages=session_data.get("messages"),
+                    restore_tool_metadata=session_data.get("tool_metadata"),
+                )
+            )
+            return
+
         # Pass restored session to the REPL
         asyncio.run(
             run_repl(

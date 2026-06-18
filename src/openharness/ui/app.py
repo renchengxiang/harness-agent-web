@@ -189,6 +189,8 @@ async def run_print_mode(
     api_client: SupportsStreamingMessages | None = None,
     permission_mode: str | None = None,
     max_turns: int | None = None,
+    restore_messages: list[dict] | None = None,
+    restore_tool_metadata: dict[str, object] | None = None,
 ) -> None:
     """Non-interactive mode: submit prompt, stream output, exit."""
     from openharness.engine.stream_events import (
@@ -221,6 +223,8 @@ async def run_print_mode(
         api_client=api_client,
         permission_prompt=_noop_permission,
         ask_user_prompt=_noop_ask,
+        restore_messages=restore_messages,
+        restore_tool_metadata=restore_tool_metadata,
     )
     await start_runtime(bundle)
 

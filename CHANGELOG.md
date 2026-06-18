@@ -8,10 +8,27 @@ The format is based on Keep a Changelog, and this project currently tracks chang
 
 ### Added
 
-- `edit_file` and `write_file` in the React TUI now preview a unified diff before applying file changes, let users approve once or for the rest of the session, and skip the extra prompt automatically in `full_auto` mode.
+- **Web 端 Harness Agent 平台**（`backend/` + `frontend/web/`）：浏览器提交任务、实时事件流、产物在线预览与下载、多用户隔离工作目录。详见 [docs/WEB_PLATFORM.md](docs/WEB_PLATFORM.md)。
+  - `backend/main.py` — FastAPI + WebSocket，调度 `oh -p` 子进程，事件落 SQLite。
+  - `backend/database.py` — 任务持久化（`tasks` 表 + 索引）。
+  - `frontend/web/` — Next.js 15 + React 19，包含 `PromptForm` / `EventLog` / `TaskHistory` / `FileManager` 组件。
+  - `oh -p` 现已支持恢复历史会话：CLI 在 `--resume` 后会把 `messages` / `tool_metadata` 透传给 `run_print_mode`，让 stream-json 模式能接续对话（`src/openharness/cli.py`、`src/openharness/ui/app.py`）。
+- `docs/WEB_PLATFORM.md` — Web 平台架构、API 列表、事件协议、状态机、启动步骤。
+
+### Changed
+
+- `httpx` 依赖从 `>=0.27.0` 升级为 `httpx[socks]>=0.27.0`，Web 平台后端需要 SOCKS 代理支持。
+
+### Removed
+
+- `backend/agent_runner_v0.py`、`backend/main_v0.py` — v0 早期 FastAPI/WebSocket 雏形，已被 `backend/main.py` 取代。
+- `backend/test.txt` — 5 字节的临时残留。
+- `backend/ai-ppt/` — 开发期的 PPT 测试样例（含 `AI演示文稿.pptx` / `ai.md` / `page_001.svg`）。
+- `backend/__pycache__/`、`backend/.next/` — Python 字节码与 Next.js 编译缓存（已加 `.gitignore`，可重新生成）。
 
 ### Fixed
 
+- `edit_file` and `write_file` in the React TUI now preview a unified diff before applying file changes, let users approve once or for the rest of the session, and skip the extra prompt automatically in `full_auto` mode.
 - Codex subscription requests now pass reasoning effort separately, enabling `gpt-5.5` with `xhigh` effort instead of treating `gpt-5.5 xhigh` as an unsupported model name.
 - Telegram channel now delivers replies again under `ohmo init --no-interactive` and other configs that do not write a `reply_to_message` field. `TelegramConfig` declares `reply_to_message: bool = True` so the attribute access in `TelegramChannel.send` no longer raises `AttributeError` and outbound progress/tool-hint/final messages are sent as expected. See issue #243.
 

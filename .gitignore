@@ -27,6 +27,21 @@ htmlcov/
 # React TUI frontend
 frontend/terminal/node_modules/
 
+# Web frontend (Next.js)
+frontend/web/node_modules/
+frontend/web/.next/
+frontend/web/.env*.local
+
+# Backend runtime artifacts (FastAPI + oh subprocess)
+backend/__pycache__/
+backend/.next/
+backend/.openharness/
+backend/harness.db
+backend/harness.db-journal
+backend/harness.db-wal
+backend/harness.db-shm
+backend/*.db
+
 # User data (never commit API keys or session data)
 .openharness/
 react_tui_smoke.txt
