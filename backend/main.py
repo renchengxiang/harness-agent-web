@@ -19,7 +19,8 @@ from pydantic import BaseModel
 from database import init_db, save_task, update_task, get_task, get_user_tasks
 
 # ─── 用户工作目录根路径 ────────────────────────────────────
-USERS_ROOT = Path("/Users/pc/www/harness_users")
+# 可通过 HARNESS_USERS_ROOT 环境变量覆盖（Docker / 部署时使用）
+USERS_ROOT = Path(os.environ.get("HARNESS_USERS_ROOT", "/Users/pc/www/harness_users"))
 USERS_ROOT.mkdir(parents=True, exist_ok=True)
 
 def get_user_cwd(user_id: str) -> str:
@@ -45,6 +46,12 @@ print(f"✅ oh 路径: {OH_PATH}")
 running_tasks: dict[str, list] = {}
 # 存储运行中任务的 subprocess 引用，用于停止任务
 running_processes: dict[str, asyncio.subprocess.Process] = {}
+
+# ─── 预览服务追踪（按 project_path 分桶，便于跨任务复用）────
+# value = {"proc": _sp.Popen, "port": int, "pid": int,
+#          "task_id": str, "started_at": float, "last_used_at": float}
+preview_services: dict[str, dict] = {}
+MAX_PREVIEWS = 3  # 同时活跃预览数上限；超过按 LRU 回收最久未用的
 
 # ─── 文件路径提取 ──────────────────────────────────────────
 PPTX_PATTERN = re.compile(r'/[^\s\'"]+\.pptx')
@@ -174,6 +181,10 @@ async def execute_task(task_id: str, user_id: str, prompt: str, is_continue: boo
     try:
         process = await start_agent(prompt, cwd, is_continue)
         running_processes[task_id] = process  # 保存引用供停止使用
+        # 增量持久化阈值：每 N 个事件刷一次 DB，防止 uvicorn --reload 重载时
+        # execute_task 收尾的 update_task 没机会执行，导致整个 stream 丢失。
+        FLUSH_EVERY = 5
+        pending_flush = 0
         async for event in read_stream(process):
             running_tasks[task_id].append(event)
 
@@ -187,6 +198,17 @@ async def execute_task(task_id: str, user_id: str, prompt: str, is_continue: boo
                 if f not in output_files:
                     output_files.append(f)
                     print(f"✅ [{task_id[:8]}] 发现输出文件: {f}")
+
+            # 增量落盘：每隔 N 个事件把 events 写回 DB，
+            # 防止 reload / crash 丢掉所有 stream。
+            pending_flush += 1
+            if pending_flush >= FLUSH_EVERY:
+                pending_flush = 0
+                await update_task(
+                    task_id,
+                    events=running_tasks[task_id],
+                    output_files=output_files,
+                )
 
     except Exception as e:
         await update_task(
@@ -253,6 +275,7 @@ async def execute_task(task_id: str, user_id: str, prompt: str, is_continue: boo
 async def lifespan(app: FastAPI):
     await init_db()
     print("✅ 数据库初始化完成")
+    _cleanup_orphan_locks()
     yield
 
 app = FastAPI(title="Harness Platform", lifespan=lifespan)
@@ -349,8 +372,29 @@ async def delete_task_endpoint(task_id: str):
 
 # 1.8 SVG 浏览器预览（启动 svg_editor 服务）
 import subprocess as _sp
+import socket as _socket
 
 SKILL_SERVER = Path("/Users/pc/.openharness/skills/ppt-master/scripts/svg_editor/server.py")
+PREVIEW_PORT_START = 5050
+
+
+def _find_free_port(start: int, exclude: set[int] = None) -> int:
+    """从 start 开始找一个本机空闲端口。
+
+    排除 exclude 中的端口（已被其它项目预约）。最多向上扫 200 个。
+    """
+    exclude = exclude or set()
+    for port in range(start, start + 200):
+        if port in exclude:
+            continue
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+            s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError(f"no free port in [{start}, {start + 200})")
 
 def _detect_project_for_preview(task_id: str) -> Path | None:
     """检测任务的 ppt-master 项目根目录（传给 server.py 的 project_dir）。
@@ -414,16 +458,147 @@ def _write_preview_lock(project_path: Path, pid: int, port: int):
     lock = project_path / ".live_preview.lock"
     lock.write_text(json.dumps({"pid": pid, "port": port, "started_at": time.time()}))
 
+
+def _kill_preview(project_key: str) -> bool:
+    """强制终止一个预览服务并清理锁文件。
+
+    project_key 通常是 str(project_path)；传 task_id 也行（向后兼容）。
+    返回 True 表示有进程被关闭。
+    """
+    svc = preview_services.get(project_key)
+    if svc:
+        proc = svc.get("proc")
+        lock_path = Path(svc.get("project_path", "")) / ".live_preview.lock" if svc.get("project_path") else None
+        try:
+            if proc and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except _sp.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+        except Exception:
+            pass
+        if lock_path and lock_path.exists():
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        preview_services.pop(project_key, None)
+        return True
+
+    # 没在内存里：可能后端刚重启、进程还活着（孤儿），直接用锁文件 kill
+    # 调用方需要把 project_path 传进来；这里接受任意 lock_path 也行
+    return False
+
+
+def _user_id_for_task(task_id: str) -> str:
+    """从 DB 反查 task 所属的 user_id（用于启动预览时注入回调环境变量）"""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(Path(__file__).parent / "harness.db"))
+        row = conn.execute("SELECT user_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        conn.close()
+        return row[0] if row else ""
+    except Exception:
+        return ""
+
+
+def _kill_preview_by_path(project_path: Path) -> bool:
+    """按 project_path 关闭预览（兼容锁文件里的孤儿进程）"""
+    key = str(project_path)
+    if key in preview_services:
+        return _kill_preview(key)
+    lock = project_path / ".live_preview.lock"
+    if lock.exists():
+        try:
+            info = json.loads(lock.read_text())
+            os.kill(info.get("pid", 0), 15)  # SIGTERM
+            try:
+                os.waitpid(info["pid"], os.WNOHANG)
+            except (ChildProcessError, OSError):
+                pass
+            lock.unlink(missing_ok=True)
+            return True
+        except (OSError, ProcessLookupError, json.JSONDecodeError):
+            try:
+                lock.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return False
+
+
+def _enforce_preview_limit():
+    """活跃预览超过 MAX_PREVIEWS 时按 LRU 杀最久未用的（last_used_at 最小）。"""
+    # 过滤出还活着的
+    alive = {
+        k: v for k, v in preview_services.items()
+        if v.get("proc") and v["proc"].poll() is None
+    }
+    if len(alive) <= MAX_PREVIEWS:
+        return
+    # 按 last_used_at 升序排
+    ordered = sorted(alive.items(), key=lambda kv: kv[1].get("last_used_at", 0))
+    to_kill = len(alive) - MAX_PREVIEWS
+    for k, _ in ordered[:to_kill]:
+        print(f"♻️ [preview] LRU 回收 {k}")
+        _kill_preview(k)
+
+
+def _cleanup_orphan_locks():
+    """后端启动时清理孤儿锁文件（指 PID 已死但锁还在的）。"""
+    if not USERS_ROOT.exists():
+        return
+    cleaned = 0
+    for lock in USERS_ROOT.rglob(".live_preview.lock"):
+        try:
+            info = json.loads(lock.read_text())
+            os.kill(info.get("pid", 0), 0)  # 不抛异常 = 还活着，保留
+        except (OSError, ProcessLookupError):
+            lock.unlink(missing_ok=True)
+            cleaned += 1
+        except (json.JSONDecodeError, KeyError):
+            lock.unlink(missing_ok=True)
+            cleaned += 1
+    if cleaned:
+        print(f"♻️ [preview] 启动时清理 {cleaned} 个孤儿锁")
+
+
 @app.post("/api/tasks/{task_id}/preview")
 async def start_preview(task_id: str):
-    """启动 ppt-master的SVG浏览器预览服务"""
+    """启动 ppt-master的SVG浏览器预览服务
+
+    端口策略：
+    - 同一项目已有预览 → 直接复用锁里的 URL
+    - 不同项目同时启动 → 第一个占 5050，第二个自动挑下一个空闲端口
+    - 锁里写过的端口也算"已占用"，避免分配到已绑定的端口
+
+    回收策略：
+    - 全局同时活跃预览数 ≤ MAX_PREVIEWS；超过则按 LRU 杀最久未用的
+    """
     project_path = _detect_project_for_preview(task_id)
     if not project_path:
         return {"error": "no ppt project found. Run agent to generate SVG files first."}
 
-    # 如果已经在运行，返回现有 URL
+    project_key = str(project_path)
+    now = time.time()
+
+    # 如果该项目已经在运行 → 直接复用并刷新 last_used_at
     existing = _read_preview_lock(project_path)
     if existing:
+        if project_key in preview_services:
+            preview_services[project_key]["last_used_at"] = now
+        else:
+            # 后端内存丢了但进程还活着（罕见），补登记
+            preview_services[project_key] = {
+                "proc": None,  # 没引用，无法 stop
+                "port": existing["port"],
+                "pid": existing["pid"],
+                "project_path": project_path,
+                "task_id": task_id,
+                "started_at": existing.get("started_at", now),
+                "last_used_at": now,
+            }
         return {
             "ok": True,
             "url": f"http://localhost:{existing['port']}",
@@ -431,19 +606,31 @@ async def start_preview(task_id: str):
             "already_running": True,
         }
 
-    # 启动新的 server.py
     if not SKILL_SERVER.exists():
         return {"error": f"svg_editor server.py not found: {SKILL_SERVER}"}
 
-    # server.py 接收的是项目根目录（包含 svg_output/），不是 svg_output/ 本身
-    # 所以 project_path 就是项目根目录
-    port = 5050
+    # 实际分配：socket bind 探测本机空闲端口，从 5050 起逐个尝试。
+    try:
+        port = _find_free_port(PREVIEW_PORT_START)
+    except RuntimeError as e:
+        return {"error": str(e)}
+
+    # 启动新进程前先按 LRU 上限回收旧预览
+    _enforce_preview_limit()
+
     proc = _sp.Popen(
         [sys.executable, str(SKILL_SERVER), str(project_path), "--no-browser", "--port", str(port)],
         cwd=str(project_path),
         stdout=_sp.DEVNULL,
         stderr=_sp.DEVNULL,
         start_new_session=True,
+        # 注入回调用环境变量：svg_editor 在 /api/save-all 成功后会自动 POST 给后端，
+        # 触发 apply-annotations 走 agent 应用修改 → 重新生成 PPTX
+        env={
+            **os.environ,
+            "HARNESS_CALLBACK_URL": f"http://127.0.0.1:8000/api/tasks/{task_id}/apply-annotations",
+            "HARNESS_USER_ID": _user_id_for_task(task_id),
+        },
     )
 
     # 等待进程启动并写锁文件（server.py 自己写 .live_preview.lock 在 project_path 下）
@@ -451,6 +638,15 @@ async def start_preview(task_id: str):
         await asyncio.sleep(0.1)
         info = _read_preview_lock(project_path)
         if info:
+            preview_services[project_key] = {
+                "proc": proc,
+                "port": info["port"],
+                "pid": info["pid"],
+                "project_path": project_path,
+                "task_id": task_id,
+                "started_at": info.get("started_at", now),
+                "last_used_at": now,
+            }
             return {
                 "ok": True,
                 "url": f"http://localhost:{info['port']}",
@@ -458,18 +654,73 @@ async def start_preview(task_id: str):
                 "already_running": False,
             }
 
-    # 检查进程是否提前退出
+    # 检查进程是否提前退出（端口冲突会在这里暴露）
     if proc.poll() is not None:
         return {"error": "preview service process exited immediately"}
 
     # 锁文件没出现但进程还在运行 — 手动写锁并返回
     _write_preview_lock(project_path, proc.pid, port)
+    preview_services[project_key] = {
+        "proc": proc,
+        "port": port,
+        "pid": proc.pid,
+        "project_path": project_path,
+        "task_id": task_id,
+        "started_at": now,
+        "last_used_at": now,
+    }
     return {
         "ok": True,
         "url": f"http://localhost:{port}",
         "project": str(project_path.relative_to(_get_task_dir(task_id).parent)),
         "already_running": False,
     }
+
+
+@app.post("/api/tasks/{task_id}/preview/stop")
+async def stop_preview(task_id: str):
+    """关闭当前任务关联的预览服务（LRU 不会主动杀它）。"""
+    project_path = _detect_project_for_preview(task_id)
+    if not project_path:
+        return {"error": "no ppt project for this task"}
+
+    project_key = str(project_path)
+    # 优先用内存里的引用（最干净的关闭路径）
+    if project_key in preview_services:
+        _kill_preview(project_key)
+        return {"ok": True, "stopped": True}
+
+    # 否则尝试从锁文件杀孤儿进程
+    if _kill_preview_by_path(project_path):
+        return {"ok": True, "stopped": True, "orphan": True}
+
+    return {"ok": True, "stopped": False, "msg": "no preview running"}
+
+
+@app.get("/api/tasks/{task_id}/preview/status")
+async def preview_status(task_id: str):
+    """查询当前任务的预览是否在跑 + URL（前端用于切按钮文案）。"""
+    project_path = _detect_project_for_preview(task_id)
+    if not project_path:
+        return {"running": False, "reason": "no ppt project"}
+
+    project_key = str(project_path)
+    # 内存记录优先；也回退到锁文件探测（孤儿进程的情况）
+    svc = preview_services.get(project_key)
+    if svc and svc.get("proc") and svc["proc"].poll() is None:
+        return {
+            "running": True,
+            "url": f"http://localhost:{svc['port']}",
+            "port": svc["port"],
+        }
+    info = _read_preview_lock(project_path)
+    if info:
+        return {
+            "running": True,
+            "url": f"http://localhost:{info['port']}",
+            "port": info["port"],
+        }
+    return {"running": False}
 
 
 # 1.9 应用 SVG 标注（重新生成 + 触发 agent 应用注解）

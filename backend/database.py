@@ -1,9 +1,12 @@
 # backend/database.py
+import os
 import aiosqlite
 import json
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "harness.db"
+# 可通过 HARNESS_DB_PATH 环境变量覆盖（Docker / 部署时挂卷用）
+DB_PATH = Path(os.environ.get("HARNESS_DB_PATH", Path(__file__).parent / "harness.db"))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 async def init_db():
     """初始化数据库表"""

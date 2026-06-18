@@ -38,13 +38,34 @@ function eventsToLogs(events: AgentEvent[]): LogItem[] {
       }
       logs.push({ id, type: "assistant", content: event.text })
     } else if (event.type === "assistant_complete" && event.text.trim()) {
-      // 完整的助理消息（如果 delta 已经合并了，这里可以跳过）
+      // 完整的助理消息：尝试与上一条已累积的 delta 合并，避免重复渲染。
+      // oh 的 stream-json 里，assistant_complete 经常携带"完整/最终"文本，而
+      // 之前已经有一串 assistant_delta 被合并到了 last.content。两者关系有 4 种：
       const last = logs[logs.length - 1]
-      if (last?.type === "assistant" && last.content === event.text) {
-        continue
+      const text = event.text
+      if (last?.type === "assistant") {
+        if (last.content === text) {
+          // 完全相同：complete 只是确认 → 跳过
+          continue
+        }
+        const lastTrim = last.content.trimEnd()
+        if (lastTrim === text.trimEnd()) {
+          // 仅尾部空白不同
+          last.content = text
+          continue
+        }
+        if (text.startsWith(lastTrim)) {
+          // text 包含 last 的全部内容 + 尾巴（complete 把之前漏发的 token 补全了）
+          last.content = text
+          continue
+        }
+        if (lastTrim.startsWith(text.trimEnd())) {
+          // last 已经包含了 text 的全部（delta 流式发送时把完整文本发出去了）
+          continue
+        }
+        // 完全不同（可能是新一轮回复开始、或上一条其实是不同 step）→ 新建一条
       }
-      // 如果 delta 已经包含了这段文本的大部分，跳过
-      logs.push({ id, type: "assistant", content: event.text })
+      logs.push({ id, type: "assistant", content: text })
     } else if (event.type === "tool_started") {
       // 格式化工具输入
       let detail = ""

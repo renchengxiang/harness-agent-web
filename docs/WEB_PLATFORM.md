@@ -71,8 +71,9 @@ uvicorn backend.main:app --reload --port 8000
 
 后端会：
 1. 自动建表（`database.init_db`）
-2. 创建 `USERS_ROOT`（默认 `/Users/pc/www/harness_users`）
-3. 解析 `oh` 路径（必须可执行）
+2. 创建 `USERS_ROOT`（默认 `/Users/pc/www/harness_users`，可用 `HARNESS_USERS_ROOT` 覆盖）
+3. 创建 SQLite 数据库（默认 `backend/harness.db`，可用 `HARNESS_DB_PATH` 覆盖）
+4. 解析 `oh` 路径（必须可执行，Docker 镜像里 `pip install -e ".[web]"` 会带进来）
 
 ### 前端
 
@@ -83,6 +84,42 @@ npm run dev    # http://localhost:3000
 ```
 
 前端通过 `NEXT_PUBLIC_API_URL`（默认 `http://localhost:8000`）连后端。
+
+### Docker 启动（推荐）
+
+前置：装好 Docker Desktop / OrbStack。
+
+```bash
+# 构建并后台启动（首次会构建两个镜像，约 3-5 分钟）
+docker compose up -d --build
+
+# 查看状态
+docker compose ps
+docker compose logs -f backend    # 后端日志
+docker compose logs -f frontend   # 前端日志
+
+# 浏览器访问
+open http://localhost:3000
+
+# 停止
+docker compose down               # 保留 volumes（数据不丢）
+docker compose down -v            # 同时清掉 volumes（数据全删）
+```
+
+镜像架构：
+- `backend` — `python:3.11-slim` 多阶段构建，先装 `openharness` 包（带入 `oh` CLI）和 `[web]` 额外依赖组（fastapi / uvicorn / aiosqlite），再裁剪到 runtime 层
+- `frontend` — `node:20-alpine` 三阶段构建（deps / builder / runner），非 root 用户跑 `next start`
+- 命名 volume：`harness_users`（工作目录）、`harness_db`（SQLite）
+- 共享网络 `harness-net`（前端通过 `depends_on` 等后端 healthcheck 通过再启动）
+
+环境变量：
+- 后端 `HARNESS_USERS_ROOT` / `HARNESS_DB_PATH` — 持久化路径（Dockerfile 内置默认值 `/data/...`，已挂卷）
+- 前端 `NEXT_PUBLIC_API_URL`（build arg）— 浏览器访问后端的地址。docker-compose 默认 `http://localhost:8000`（从浏览器视角）。**如果部署到服务器改成反代路径，改 `docker-compose.yml` 里 frontend.build.args.NEXT_PUBLIC_API_URL 后重新 build**
+- API key：取消 `docker-compose.yml` 里 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` 的注释，并在 host 配好 `.env` 文件
+
+挂载项目目录（让 agent 能改你机器上的代码）：
+- 取消 `docker-compose.yml` 里 backend.volumes 的 `- /Users/pc/www:/projects:rw` 注释并改成你的项目根目录
+- 创建任务时把 `cwd` 传 `/projects/<你的项目名>`
 
 ### 端到端冒烟
 

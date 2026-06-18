@@ -3,7 +3,7 @@
 
 import { useState, useCallback, useEffect, useRef } from "react"
 import { Badge } from "@/components/ui/badge"
-import { Bot, Download, FileText, FolderOpen, ExternalLink, Loader2 } from "lucide-react"
+import { Bot, Download, FileText, FolderOpen, ExternalLink, Loader2, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { PromptForm, ChatMode }    from "@/components/PromptForm"
 import { EventLog }     from "@/components/EventLog"
@@ -28,6 +28,8 @@ export default function Home() {
   const [refreshTrigger, setRefresh]  = useState(0)
   const [fileManagerOpen, setFileManagerOpen] = useState(false)
   const [previewLoading, setPreviewLoading]   = useState(false)
+  const [previewRunning, setPreviewRunning]   = useState(false)
+  const [previewUrl, setPreviewUrl]           = useState<string | null>(null)
 
   // 客户端获取 userId（避免 SSR 问题）
   useEffect(() => { setUserId(getUserId()) }, [])
@@ -43,6 +45,8 @@ export default function Home() {
         if (prev.phase !== "running" || prev.taskId !== targetTaskId) return prev
         if (event.type === "ready") {
           const readyEvent = event as { type: "ready"; output_files?: string[] }
+          // 同步刷新左侧历史列表（后端 DB 此时 status=ready）
+          setRefresh((n) => n + 1)
           return {
             phase: "ready" as const,
             taskId: prev.taskId,
@@ -63,6 +67,7 @@ export default function Home() {
     },
     onDone: (result: DoneEvent) => {
       setTask((prev) => {
+        if (prev.phase === "idle") return prev
         if (prev.taskId !== targetTaskId) return prev
         if (prev.phase === "done" || prev.phase === "ready") return prev
         if (prev.phase !== "running") return prev
@@ -245,18 +250,53 @@ export default function Home() {
     if (!currentTaskId) return
     setPreviewLoading(true)
     try {
-      const { startPreview } = await import("@/lib/api")
-      const result = await startPreview(currentTaskId)
-      if (result.ok && result.url) {
-        window.open(result.url, "_blank", "noopener,noreferrer")
+      const { startPreview, stopPreview, getPreviewStatus } = await import("@/lib/api")
+      if (previewRunning) {
+        // 已运行 → 关闭
+        await stopPreview(currentTaskId)
+        setPreviewRunning(false)
+        setPreviewUrl(null)
       } else {
-        alert(`启动预览失败: ${result.error || "未知错误"}`)
+        // 未运行 → 启动
+        const result = await startPreview(currentTaskId)
+        if (result.ok && result.url) {
+          setPreviewRunning(true)
+          setPreviewUrl(result.url)
+          window.open(result.url, "_blank", "noopener,noreferrer")
+        } else {
+          alert(`启动预览失败: ${result.error || "未知错误"}`)
+        }
       }
     } catch (e) {
-      console.error("启动预览失败", e)
-      alert("启动预览失败")
+      console.error("预览操作失败", e)
+      alert(previewRunning ? "关闭预览失败" : "启动预览失败")
     }
     setPreviewLoading(false)
+  }, [currentTaskId, previewRunning])
+
+  // 切换任务时探测当前任务是否已有预览进程在跑（决定按钮文案）
+  useEffect(() => {
+    let cancelled = false
+    if (!currentTaskId) {
+      setPreviewRunning(false)
+      setPreviewUrl(null)
+      return
+    }
+    ;(async () => {
+      try {
+        const { getPreviewStatus } = await import("@/lib/api")
+        const s = await getPreviewStatus(currentTaskId)
+        if (cancelled) return
+        setPreviewRunning(!!s.running)
+        setPreviewUrl(s.url || null)
+      } catch {
+        if (!cancelled) {
+          setPreviewRunning(false)
+          setPreviewUrl(null)
+        }
+      }
+    })()
+    return () => { cancelled = true }
   }, [currentTaskId])
 
   const handleNewChat = useCallback(() => {
@@ -348,11 +388,19 @@ export default function Home() {
                 <FolderOpen className="h-3.5 w-3.5 mr-1" />
                 文件
               </Button>
-              <Button variant="ghost" size="sm" onClick={handleStartPreview} disabled={previewLoading}>
+              <Button
+                variant={previewRunning ? "secondary" : "ghost"}
+                size="sm"
+                onClick={handleStartPreview}
+                disabled={previewLoading}
+                title={previewRunning ? "关闭预览服务" : "启动预览服务"}
+              >
                 {previewLoading
                   ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
+                  : previewRunning
+                  ? <X className="h-3.5 w-3.5 mr-1" />
                   : <ExternalLink className="h-3.5 w-3.5 mr-1" />}
-                预览
+                {previewRunning ? "关闭预览" : "预览"}
               </Button>
             </div>
           </header>

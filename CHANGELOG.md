@@ -13,7 +13,14 @@ The format is based on Keep a Changelog, and this project currently tracks chang
   - `backend/database.py` — 任务持久化（`tasks` 表 + 索引）。
   - `frontend/web/` — Next.js 15 + React 19，包含 `PromptForm` / `EventLog` / `TaskHistory` / `FileManager` 组件。
   - `oh -p` 现已支持恢复历史会话：CLI 在 `--resume` 后会把 `messages` / `tool_metadata` 透传给 `run_print_mode`，让 stream-json 模式能接续对话（`src/openharness/cli.py`、`src/openharness/ui/app.py`）。
-- `docs/WEB_PLATFORM.md` — Web 平台架构、API 列表、事件协议、状态机、启动步骤。
+- **Docker 化部署**：`docker compose up -d --build` 一键启动后端 + 前端。
+  - `backend/Dockerfile` — `python:3.11-slim` 多阶段构建，安装 `openharness` 包 + `[web]` 依赖组（带入 `oh` CLI + fastapi/uvicorn/aiosqlite）。
+  - `frontend/web/Dockerfile` — `node:20-alpine` 三阶段构建（deps / builder / runner），非 root 用户跑 `next start`。
+  - `docker-compose.yml` — 两个服务 + 两个命名 volume（`harness_users` 工作目录、`harness_db` SQLite）+ 健康检查 + 共享网络。
+  - `.dockerignore` — 排除测试、runtime 产物、IDE 配置等。
+- **环境变量支持**：`HARNESS_USERS_ROOT` / `HARNESS_DB_PATH` 覆盖默认硬编码路径，Docker 与生产部署无需改源码。
+- **Web 依赖组**：`pyproject.toml` 新增 `[web]` 额外依赖组（`fastapi` / `uvicorn[standard]` / `aiosqlite` / `python-multipart`），镜像构建只装该组，体积更小。
+- `docs/WEB_PLATFORM.md` — Web 平台架构、API 列表、事件协议、状态机、启动步骤、Docker 启动章节。
 
 ### Changed
 

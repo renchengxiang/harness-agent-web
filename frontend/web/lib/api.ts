@@ -177,6 +177,26 @@ export async function startPreview(taskId: string): Promise<{
   return resp.json()
 }
 
+export async function stopPreview(taskId: string): Promise<{
+  ok?: boolean
+  stopped?: boolean
+  orphan?: boolean
+  error?: string
+}> {
+  const resp = await fetch(`${BASE_URL}/api/tasks/${taskId}/preview/stop`, { method: "POST" })
+  return resp.json()
+}
+
+export async function getPreviewStatus(taskId: string): Promise<{
+  running: boolean
+  url?: string
+  port?: number
+  reason?: string
+}> {
+  const resp = await fetch(`${BASE_URL}/api/tasks/${taskId}/preview/status`)
+  return resp.json()
+}
+
 export async function applyAnnotations(
   taskId: string,
   userId: string,

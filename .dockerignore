@@ -1,0 +1,57 @@
+# Git
+.git/
+.github/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+.openharness-venv/
+venv/
+env/
+*.so
+.coverage
+htmlcov/
+
+# Node / Frontend
+frontend/web/node_modules/
+frontend/web/.next/
+frontend/web/.env*.local
+frontend/terminal/node_modules/
+
+# Backend runtime artifacts（Docker 镜像里要重新生成 / 挂卷）
+backend/__pycache__/
+backend/.next/
+backend/.openharness/
+backend/harness.db
+backend/harness.db-journal
+backend/harness.db-wal
+backend/harness.db-shm
+backend/*.db
+
+# 测试 / 文档 / IDE
+tests/
+docs/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# CI / 测试脚本
+react_tui_smoke.txt
+uv.lock
+
+# autopilot-dashboard（暂未参与构建）
+autopilot-dashboard/
+
+# 用户运行时数据
+.openharness/
