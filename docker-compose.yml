@@ -14,18 +14,34 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
+      # 预览服务端口范围：start_preview 从 5050 起逐个挑可用端口（最多 ~10 个并发预览）
+      - "5050-5060:5050-5060"
     environment:
       # 工作目录 / 数据库都指向挂卷，方便持久化
       HARNESS_USERS_ROOT: /data/harness_users
       HARNESS_DB_PATH: /data/harness.db
+      # SVG 预览服务在容器里必须 bind 0.0.0.0，否则宿主机端口映射访问不到
+      SVG_EDITOR_HOST: 0.0.0.0
       # 可选：透传 host 上的 API key 给容器里的 oh
       # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       # OPENAI_API_KEY: ${OPENAI_API_KEY}
     volumes:
-      # 用户工作目录（每个任务生成的代码 / 产物）
-      - harness_users:/data/harness_users
-      # SQLite 数据库
-      - harness_db:/data/harness.db
+      # 整个 /data 命名卷：包含 users 目录 + harness.db 文件
+      # ⚠️ 不能把 harness_db 卷挂到 /data/harness.db 这种"文件"路径——
+      # 第一次挂载时 docker 会把它当目录，导致 aiosqlite 报
+      # "unable to open database file"。改成挂目录，DB 文件路径在容器里自由指定。
+      - harness_data:/data
+      # 把宿主机整个 ~/.openharness bind-mount 进容器，让 oh 复用：
+      # - credentials.json（API key）
+      # - settings.json / settings_minimax.json（模型/provider 配置）
+      # - skills/（技能定义，包括预览用的 ppt-master）
+      # - local_rules/（全局规则、facts）
+      # - data/sessions/（-c 续写依赖的 session 快照）
+      # - data/memory/、data/tasks/、data/session-memory/（长期记忆 / 任务元数据）
+      # - plugins/（插件）
+      # 容器内运行的用户是 root，所以目标是 /root/.openharness。
+      # ⚠️ 不挂 :ro，因为 oh 会在 data/ 下写 session/memory，挂只读会导致写失败。
+      - ${HOME}/.openharness:/root/.openharness
       # 可选：把 host 上的项目目录挂给 agent 编辑
       # 取消下一行注释并改成你的项目路径
       # - /Users/pc/www:/projects:rw
@@ -58,10 +74,8 @@ services:
       - harness-net
 
 volumes:
-  harness_users:
-    name: harness_users
-  harness_db:
-    name: harness_db
+  harness_data:
+    name: harness_data
 
 networks:
   harness-net:

@@ -243,6 +243,89 @@ export default function Home() {
     }
   }, [subscribeToTask])
 
+  // ─────────────────────────────────────────────────────────
+  // 轮询兜底：标注 / 外部触发 / 任意让 status 回到 running 的入口
+  // 都不会通知聊天页 WS。我们每 2s 主动 GET 一次 events，
+  // 发现 status=running 就重连 WS 并把事件合上去。
+  // ─────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!currentTaskId) return
+    // 只在非 running 阶段轮询。running 时 WS 自己推送。
+    if (task.phase === "running") return
+
+    let cancelled = false
+    const tick = async () => {
+      if (cancelled) return
+      try {
+        const data = await getTaskEvents(currentTaskId)
+        if (cancelled) return
+        const dbStatus = data.status as TaskMeta["status"]
+        const dbEvents = (data.events || []) as AgentEvent[]
+        const dbOutputFiles = data.output_files || []
+
+        setTask((prev) => {
+          if (prev.phase === "idle") return prev
+          // 后端已经在跑 → 切回 running，把已存在的后端事件补到前端流
+          if (dbStatus === "running" || dbStatus === "pending") {
+            if (prev.phase === "running") return prev
+            const backendOffset = prev.events.filter((e: AgentEvent) => e.type !== "user_message").length
+            const merged = [...prev.events]
+            for (const ev of dbEvents.slice(backendOffset)) {
+              merged.push(ev)
+            }
+            return { phase: "running", taskId: currentTaskId, events: merged }
+          }
+          // 后端 ready 但前端停留在别的 phase（外部触发标注完成） → 同步结果
+          if (dbStatus === "ready") {
+            if (prev.phase === "ready") {
+              // ready 状态下 output_files 变化 → 同步
+              const local = prev.outputFiles || []
+              if (local.length !== dbOutputFiles.length ||
+                  dbOutputFiles.some((f: string, i: number) => f !== local[i])) {
+                return { ...prev, outputFiles: dbOutputFiles }
+              }
+              return prev
+            }
+            return {
+              phase: "ready",
+              taskId: currentTaskId,
+              events: prev.events,
+              outputFiles: dbOutputFiles,
+            }
+          }
+          // 后端 waiting_user / done 但前端停留在 running（不太可能，但兜底）
+          if ((dbStatus === "waiting_user" || dbStatus === "done") && prev.phase === "running") {
+            return {
+              phase: "done",
+              taskId: currentTaskId,
+              events: prev.events,
+              result: { type: "done", status: dbStatus },
+            }
+          }
+          return prev
+        })
+
+        // 需要重连 WS 的场景：刚切到 running
+        if (dbStatus === "running" || dbStatus === "pending") {
+          subscribeToTask(currentTaskId, dbEvents.length)
+        }
+        // ready 状态变了才触发左侧列表刷新（output_files 变更无意义给列表看）
+        if (dbStatus === "ready") {
+          setRefresh((n) => n + 1)
+        }
+      } catch {
+        // 网络抖动忽略
+      }
+    }
+
+    const intervalId = window.setInterval(tick, 2000)
+    tick()  // 立即跑一次
+    return () => {
+      cancelled = true
+      window.clearInterval(intervalId)
+    }
+  }, [currentTaskId, task.phase, subscribeToTask])
+
   // 卸载时清理订阅
   useEffect(() => () => { subscribeCleanupRef.current?.() }, [])
 

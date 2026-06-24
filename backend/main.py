@@ -18,6 +18,10 @@ from pydantic import BaseModel
 
 from database import init_db, save_task, update_task, get_task, get_user_tasks
 
+# ─── DB 路径同步 helper（部分路由用同步 sqlite3 直连，需与 database.DB_PATH 保持一致） ───
+import database as _db_mod  # noqa: E402
+_DB_PATH = _db_mod.DB_PATH
+
 # ─── 用户工作目录根路径 ────────────────────────────────────
 # 可通过 HARNESS_USERS_ROOT 环境变量覆盖（Docker / 部署时使用）
 USERS_ROOT = Path(os.environ.get("HARNESS_USERS_ROOT", "/Users/pc/www/harness_users"))
@@ -54,15 +58,27 @@ preview_services: dict[str, dict] = {}
 MAX_PREVIEWS = 3  # 同时活跃预览数上限；超过按 LRU 回收最久未用的
 
 # ─── 文件路径提取 ──────────────────────────────────────────
-PPTX_PATTERN = re.compile(r'/[^\s\'"]+\.pptx')
+PPTX_PATTERN = re.compile(r'(?:/|(?:[\w.\-]+/)+)[^\s\'"]+\.pptx')
 
-def extract_pptx_paths(event: dict) -> list[str]:
-    """提取事件中所有真实存在的 PPTX 文件路径"""
+def extract_pptx_paths(event: dict, cwd: str | Path | None = None) -> list[str]:
+    """提取事件中所有真实存在的 PPTX 文件路径
+
+    支持绝对路径(/...)与相对路径(projects/.../x.pptx);相对路径需传入 cwd 才能 exists 校验。
+    返回的路径统一为绝对路径,方便后续下载/打包。
+    """
     text = json.dumps(event, ensure_ascii=False)
-    found = []
+    found: list[str] = []
+    cwd_path = Path(cwd) if cwd else None
     for path in PPTX_PATTERN.findall(text):
-        if Path(path).exists() and path not in found:
-            found.append(path)
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            if cwd_path is None:
+                continue
+            candidate = cwd_path / path
+        if candidate.exists():
+            abs_path = str(candidate.resolve())
+            if abs_path not in found:
+                found.append(abs_path)
     return found
 
 # ─── 等待用户确认的判断 ──────────────────────────────────────
@@ -133,6 +149,10 @@ async def execute_task(task_id: str, user_id: str, prompt: str, is_continue: boo
         running_tasks[task_id] = []
     output_files: list[str] = []
     last_assistant_text = ""
+    # 续写场景下，下面会把已有 events 灌进 running_tasks。最终状态判断只能看本轮新增
+    # 的事件，否则一次 stop（留下 error 事件）会让后续每一次 reply 都被判成 error，
+    # 哪怕新一轮跑得很完美（PPTX 已生成）。这里记录"续写起点"。
+    history_offset = 0
 
     # 如果是续写，恢复之前的事件和已发现的文件
     if is_continue:
@@ -144,6 +164,7 @@ async def execute_task(task_id: str, user_id: str, prompt: str, is_continue: boo
             output_files = existing_files.copy()
         if existing_events:
             running_tasks[task_id] = existing_events.copy()
+            history_offset = len(existing_events)
 
         # 取最近一段 assistant 文本作为上下文摘要（避免 prompt 过长）
         last_assistant = ""
@@ -193,7 +214,7 @@ async def execute_task(task_id: str, user_id: str, prompt: str, is_continue: boo
                 last_assistant_text = event.get("text", "")
 
             # 实时提取文件路径（去重追加）
-            new_files = extract_pptx_paths(event)
+            new_files = extract_pptx_paths(event, cwd=cwd)
             for f in new_files:
                 if f not in output_files:
                     output_files.append(f)
@@ -223,6 +244,9 @@ async def execute_task(task_id: str, user_id: str, prompt: str, is_continue: boo
     # 任务完成/退出，清理进程引用
     running_processes.pop(task_id, None)
     events = running_tasks.pop(task_id, [])
+    # 续写时，状态判定只看本轮新增事件；output_files 已经在循环里增量合并到全集，
+    # 仍然反映完整产出。
+    new_events = events[history_offset:] if history_offset else events
 
     # 如果是被用户停止的（returncode != 0 且 -9/SIGKILL）
     if process and process.returncode and process.returncode < 0:
@@ -234,17 +258,17 @@ async def execute_task(task_id: str, user_id: str, prompt: str, is_continue: boo
         )
         return
 
-    # 检查是否有错误事件
-    has_any_error = any(e.get("type") == "error" for e in events)
+    # 检查是否有错误事件（仅本轮）
+    has_any_error = any(e.get("type") == "error" for e in new_events)
     has_unrecoverable_error = any(
         e.get("type") == "error" and not e.get("recoverable", True)
-        for e in events
+        for e in new_events
     )
 
     # 检查是否是 API 限流（recoverable=True 的 429 错误）
     is_rate_limit = any(
         e.get("type") == "error" and "429" in str(e.get("message", ""))
-        for e in events
+        for e in new_events
     )
 
     # 状态决断逻辑
@@ -353,7 +377,7 @@ async def stop_task(task_id: str):
 async def delete_task_endpoint(task_id: str):
     """删除任务记录和工作目录"""
     import sqlite3
-    db_path = Path(__file__).parent / "harness.db"
+    db_path = _DB_PATH
     try:
         conn = sqlite3.connect(str(db_path))
         row = conn.execute("SELECT user_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -374,7 +398,15 @@ async def delete_task_endpoint(task_id: str):
 import subprocess as _sp
 import socket as _socket
 
-SKILL_SERVER = Path("/Users/pc/.openharness/skills/ppt-master/scripts/svg_editor/server.py")
+# svg_editor server.py 的绝对路径。可通过 OPENHARNESS_SVG_SERVER 覆盖
+# （Docker / 部署时通常不需要，Python 会用 $HOME 拼默认值）。
+_SKILL_SERVER_FALLBACK = Path(
+    os.environ.get(
+        "OPENHARNESS_SVG_SERVER",
+        str(Path.home() / ".openharness/skills/ppt-master/scripts/svg_editor/server.py"),
+    )
+)
+SKILL_SERVER = _SKILL_SERVER_FALLBACK
 PREVIEW_PORT_START = 5050
 
 
@@ -496,7 +528,7 @@ def _user_id_for_task(task_id: str) -> str:
     """从 DB 反查 task 所属的 user_id（用于启动预览时注入回调环境变量）"""
     import sqlite3
     try:
-        conn = sqlite3.connect(str(Path(__file__).parent / "harness.db"))
+        conn = sqlite3.connect(str(_DB_PATH))
         row = conn.execute("SELECT user_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
         conn.close()
         return row[0] if row else ""
@@ -630,6 +662,9 @@ async def start_preview(task_id: str):
             **os.environ,
             "HARNESS_CALLBACK_URL": f"http://127.0.0.1:8000/api/tasks/{task_id}/apply-annotations",
             "HARNESS_USER_ID": _user_id_for_task(task_id),
+            # 容器部署时透传 SVG_EDITOR_HOST=0.0.0.0，让宿主机能通过端口映射访问
+            # （compose 暴露 5050-5060）。本地直接跑时不设这个 env，server.py 会用 127.0.0.1。
+            **({"SVG_EDITOR_HOST": os.environ["SVG_EDITOR_HOST"]} if "SVG_EDITOR_HOST" in os.environ else {}),
         },
     )
 
@@ -928,7 +963,7 @@ def _get_task_dir(task_id: str) -> Path | None:
     """获取任务的工作目录"""
     import sqlite3
     try:
-        conn = sqlite3.connect(str(Path(__file__).parent / "harness.db"))
+        conn = sqlite3.connect(str(_DB_PATH))
         row = conn.execute("SELECT user_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
         conn.close()
         if row:

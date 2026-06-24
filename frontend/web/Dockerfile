@@ -4,9 +4,13 @@
 FROM node:20-alpine AS deps
 WORKDIR /app
 
+# npm 走淘宝镜像加速（默认 registry 在国内经常 timeout）
+RUN npm config set registry https://registry.npmmirror.com
+
 # 单独 COPY package 文件，最大化依赖层缓存
 COPY package.json package-lock.json* ./
-RUN npm ci
+# 用 install 而非 ci：package-lock.json 可能与 package.json 不一致（缺新加的包）
+RUN npm install --no-audit --no-fund
 
 # ─── Stage 2: 构建 ────────────────────────────────────────
 FROM node:20-alpine AS builder
