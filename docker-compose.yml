@@ -1,10 +1,27 @@
 # Docker Compose for Harness Agent Web Platform
 # 启动：  docker compose up -d --build
 # 停止：  docker compose down
-# 日志：  docker compose logs -f backend
-# 重启：  docker compose restart backend
+# 日志：  docker compose logs -f
 
 services:
+  # --- Nginx 网关入口 ---
+  nginx:
+    image: nginx:alpine
+    container_name: harness-nginx
+    restart: unless-stopped
+    ports:
+      - "8002:80"  # 外部只需访问 8002 即可
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      frontend:
+        condition: service_started
+      backend:
+        condition: service_healthy
+    networks:
+      - harness-net
+
+  # --- 后端服务 ---
   backend:
     build:
       context: .
@@ -12,43 +29,22 @@ services:
     image: harness-agent-backend:latest
     container_name: harness-backend
     restart: unless-stopped
+    # 提示：如果不想暴露后端 8000 端口给公网，可以把下面 "8000:8000" 注释掉
+    # 这样后端就只能通过 Nginx/内网 访问，更安全。
     ports:
       - "8000:8000"
-      # 预览服务端口范围：start_preview 从 5050 起逐个挑可用端口（最多 ~10 个并发预览）
+      # 预览服务端口范围：start_preview 从 5050 起逐个挑可用端口
       - "5050-5060:5050-5060"
     environment:
-      # 工作目录 / 数据库都指向挂卷，方便持久化
       HARNESS_USERS_ROOT: /data/harness_users
       HARNESS_DB_PATH: /data/harness.db
-      # SVG 预览服务在容器里必须 bind 0.0.0.0，否则宿主机端口映射访问不到
       SVG_EDITOR_HOST: 0.0.0.0
-      # JWT 鉴权（>=32 字符；可通过 .env 覆盖）
       HARNESS_JWT_SECRET: ${HARNESS_JWT_SECRET:?请在 .env 中设置 HARNESS_JWT_SECRET（>=32 字符）}
       HARNESS_ADMIN_USERNAME: ${HARNESS_ADMIN_USERNAME:-admin}
       HARNESS_ADMIN_PASSWORD: ${HARNESS_ADMIN_PASSWORD:-admin123}
-      # 可选：透传 host 上的 API key 给容器里的 oh
-      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-      # OPENAI_API_KEY: ${OPENAI_API_KEY}
     volumes:
-      # 整个 /data 命名卷：包含 users 目录 + harness.db 文件
-      # ⚠️ 不能把 harness_db 卷挂到 /data/harness.db 这种"文件"路径——
-      # 第一次挂载时 docker 会把它当目录，导致 aiosqlite 报
-      # "unable to open database file"。改成挂目录，DB 文件路径在容器里自由指定。
       - harness_data:/data
-      # 把宿主机整个 ~/.openharness bind-mount 进容器，让 oh 复用：
-      # - credentials.json（API key）
-      # - settings.json / settings_minimax.json（模型/provider 配置）
-      # - skills/（技能定义，包括预览用的 ppt-master）
-      # - local_rules/（全局规则、facts）
-      # - data/sessions/（-c 续写依赖的 session 快照）
-      # - data/memory/、data/tasks/、data/session-memory/（长期记忆 / 任务元数据）
-      # - plugins/（插件）
-      # 容器内运行的用户是 root，所以目标是 /root/.openharness。
-      # ⚠️ 不挂 :ro，因为 oh 会在 data/ 下写 session/memory，挂只读会导致写失败。
       - ${HOME}/.openharness:/root/.openharness
-      # 可选：把 host 上的项目目录挂给 agent 编辑
-      # 取消下一行注释并改成你的项目路径
-      # - /Users/pc/www:/projects:rw
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/docs')"]
       interval: 30s
@@ -58,19 +54,18 @@ services:
     networks:
       - harness-net
 
+  # --- 前端服务 ---
   frontend:
     build:
       context: ./frontend/web
       dockerfile: Dockerfile
       args:
-        # 浏览器端通过 8000 端口访问后端（docker host 的 localhost）
-        # 如果用反向代理，可以改成 '/api'
-        NEXT_PUBLIC_API_URL: http://localhost:8000
+        # 修改为相对路径 /api，浏览器会请求 当前域名:8002/api/...
+        NEXT_PUBLIC_API_URL: /api
     image: harness-agent-frontend:latest
     container_name: harness-frontend
     restart: unless-stopped
-    ports:
-      - "8002:3000"
+    # 删除了 ports: "8002:3000"，保护前端不被直接外网访问
     depends_on:
       backend:
         condition: service_healthy
