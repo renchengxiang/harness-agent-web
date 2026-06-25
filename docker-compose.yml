@@ -70,7 +70,7 @@ services:
     container_name: harness-frontend
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "8002:3000"
     depends_on:
       backend:
         condition: service_healthy
