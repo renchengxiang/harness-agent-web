@@ -8,15 +8,32 @@ import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import Annotated, AsyncGenerator, Literal
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile
+import bcrypt
+import jwt
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
-from database import init_db, save_task, update_task, get_task, get_user_tasks
+from database import (
+    create_user,
+    get_user_by_id,
+    get_user_by_username,
+    get_user_tasks,
+    get_user_usage,
+    init_db,
+    list_users_with_usage,
+    public_user,
+    save_task,
+    update_task,
+    update_user,
+    get_task,
+)
 
 # ─── DB 路径同步 helper（部分路由用同步 sqlite3 直连，需与 database.DB_PATH 保持一致） ───
 import database as _db_mod  # noqa: E402
@@ -26,6 +43,18 @@ _DB_PATH = _db_mod.DB_PATH
 # 可通过 HARNESS_USERS_ROOT 环境变量覆盖（Docker / 部署时使用）
 USERS_ROOT = Path(os.environ.get("HARNESS_USERS_ROOT", "/Users/pc/www/harness_users"))
 USERS_ROOT.mkdir(parents=True, exist_ok=True)
+
+JWT_SECRET = os.environ.get("HARNESS_JWT_SECRET", "dev-only-change-me")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_HOURS = int(os.environ.get("HARNESS_JWT_EXPIRE_HOURS", "24"))
+security = HTTPBearer(auto_error=False)
+
+if not JWT_SECRET or len(JWT_SECRET) < 32:
+    raise RuntimeError(
+        "HARNESS_JWT_SECRET 未设置或长度过短（<32 字符），请通过环境变量注入强随机密钥后重启"
+    )
+if JWT_SECRET == "dev-only-change-me":
+    print("⚠️ HARNESS_JWT_SECRET 仍为开发默认值 dev-only-change-me，请勿用于生产环境")
 
 def get_user_cwd(user_id: str) -> str:
     """每个用户独立工作目录"""
@@ -149,6 +178,16 @@ async def execute_task(task_id: str, user_id: str, prompt: str, is_continue: boo
         running_tasks[task_id] = []
     output_files: list[str] = []
     last_assistant_text = ""
+    total_input_tokens = 0
+    total_output_tokens = 0
+    # 当 LLM provider 不返回 usage 时，用文本长度 / 4 做粗估（与 ohmo 的 token_estimation 一致）。
+    # 估算规则：output = 本轮 assistant 文本字符 / 4；
+    #          input = 此前所有 assistant 输出累积字符 / 4（粗略代表历史 context）。
+    # 若任一轮次拿到真实 usage > 0，则全任务标记 token_estimated=0；只要发生过估算就标 1。
+    has_real_usage = False
+    used_estimate = False
+    # 历史 assistant 输出总字符（仅用于估算输入）
+    accum_assistant_chars = 0
     # 续写场景下，下面会把已有 events 灌进 running_tasks。最终状态判断只能看本轮新增
     # 的事件，否则一次 stop（留下 error 事件）会让后续每一次 reply 都被判成 error，
     # 哪怕新一轮跑得很完美（PPTX 已生成）。这里记录"续写起点"。
@@ -212,6 +251,24 @@ async def execute_task(task_id: str, user_id: str, prompt: str, is_continue: boo
             # 记录最后一句话，用于判断是否在等待确认
             if event.get("type") == "assistant_complete":
                 last_assistant_text = event.get("text", "")
+                real_input = int(event.get("input_tokens") or 0)
+                real_output = int(event.get("output_tokens") or 0)
+                text_chars = len(last_assistant_text)
+
+                if real_input > 0 or real_output > 0:
+                    # 真实 usage
+                    total_input_tokens += real_input
+                    total_output_tokens += real_output
+                    has_real_usage = True
+                else:
+                    # LLM provider 没返回 usage：使用字符数 / 4 的粗略估算。
+                    est_output = max(1, text_chars // 4)
+                    est_input = max(0, accum_assistant_chars // 4)
+                    total_input_tokens += est_input
+                    total_output_tokens += est_output
+                    used_estimate = True
+
+                accum_assistant_chars += text_chars
 
             # 实时提取文件路径（去重追加）
             new_files = extract_pptx_paths(event, cwd=cwd)
@@ -227,8 +284,12 @@ async def execute_task(task_id: str, user_id: str, prompt: str, is_continue: boo
                 pending_flush = 0
                 await update_task(
                     task_id,
+                    status="running",
                     events=running_tasks[task_id],
                     output_files=output_files,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    token_estimated=1 if used_estimate else (0 if has_real_usage else 0),
                 )
 
     except Exception as e:
@@ -236,7 +297,10 @@ async def execute_task(task_id: str, user_id: str, prompt: str, is_continue: boo
             task_id,
             status="error",
             error=str(e),
-            events=running_tasks.pop(task_id, [])
+            events=running_tasks.pop(task_id, []),
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            token_estimated=1 if used_estimate else 0,
         )
         running_processes.pop(task_id, None)
         return
@@ -255,6 +319,9 @@ async def execute_task(task_id: str, user_id: str, prompt: str, is_continue: boo
             status="error",
             error="任务被用户停止",
             events=events,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            token_estimated=1 if used_estimate else 0,
         )
         return
 
@@ -292,12 +359,16 @@ async def execute_task(task_id: str, user_id: str, prompt: str, is_continue: boo
         status=final_status,
         output_files=output_files,
         events=events,
+        input_tokens=total_input_tokens,
+        output_tokens=total_output_tokens,
+        token_estimated=1 if used_estimate else 0,
     )
 
 # ─── 生命周期：启动时初始化数据库 ─────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    await _ensure_default_admin()
     print("✅ 数据库初始化完成")
     _cleanup_orphan_locks()
     yield
@@ -312,6 +383,8 @@ app.add_middleware(
 
 # ─── API 路由 ──────────────────────────────────────────────
 
+CurrentUser = dict | None
+
 class TaskRequest(BaseModel):
     prompt: str
     user_id: str
@@ -320,6 +393,22 @@ class ReplyRequest(BaseModel):
     content: str
     user_id: str
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class CreateUserRequest(BaseModel):
+    username: str
+    password: str
+    role: Literal["admin", "user"] = "user"
+    display_name: str = ""
+
+class UpdateUserRequest(BaseModel):
+    password: str | None = None
+    role: Literal["admin", "user"] | None = None
+    display_name: str | None = None
+    disabled: bool | None = None
+
 class FileWriteRequest(BaseModel):
     path: str   # 相对 task_cwd 的路径
     content: str
@@ -327,35 +416,170 @@ class FileWriteRequest(BaseModel):
 class FileUploadRequest(BaseModel):
     path: str   # 相对 task_cwd 的目录路径
 
+
+def _hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def _verify_password(password: str, password_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+    except ValueError:
+        return False
+
+
+def _user_payload(user: dict) -> dict:
+    return {
+        "sub": user["id"],
+        "username": user["username"],
+        "role": user["role"],
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS),
+    }
+
+
+def _create_access_token(user: dict) -> str:
+    return jwt.encode(_user_payload(user), JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+async def _ensure_default_admin():
+    users = await list_users_with_usage()
+    if any(user.get("role") == "admin" for user in users):
+        return
+    username = os.environ.get("HARNESS_ADMIN_USERNAME", "admin")
+    password = os.environ.get("HARNESS_ADMIN_PASSWORD", "admin123")
+    if password == "admin123":
+        print("⚠️ 使用默认管理员密码 admin123，请尽快修改或设置 HARNESS_ADMIN_PASSWORD")
+    await create_user(
+        str(uuid.uuid4()),
+        username,
+        _hash_password(password),
+        role="admin",
+        display_name="Administrator",
+    )
+    print(f"✅ 默认管理员已创建: {username}")
+
+
+async def get_current_user(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security)] = None,
+) -> CurrentUser:
+    if credentials is None:
+        return None
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.PyJWTError:
+        return None
+    user_id = payload.get("sub")
+    if not user_id:
+        return None
+    user = await get_user_by_id(user_id)
+    if not user or user.get("disabled"):
+        return None
+    return public_user(user)
+
+
+async def require_user(current_user: Annotated[CurrentUser, Depends(get_current_user)]) -> dict:
+    if not current_user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="需要登录")
+    return current_user
+
+
+async def require_admin(current_user: Annotated[dict, Depends(require_user)]) -> dict:
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="需要管理员权限")
+    return current_user
+
+
+def _can_access_task(current_user: dict, task: dict) -> bool:
+    """判断 current_user 是否能访问 task。
+
+    所有调用方都要求登录。管理员可访问全部；普通用户只能访问自己的 task。
+    """
+    if current_user is None:
+        return False
+    return current_user.get("role") == "admin" or task.get("user_id") == current_user.get("id")
+
+
+def _task_meta(task: dict) -> dict:
+    input_tokens = int(task.get("input_tokens") or 0)
+    output_tokens = int(task.get("output_tokens") or 0)
+    return {
+        "task_id": task["id"],
+        "user_id": task.get("user_id"),
+        "prompt": task["prompt"],
+        "status": task["status"],
+        "output_file": task.get("output_file"),
+        "output_files": task.get("output_files"),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "token_estimated": bool(task.get("token_estimated")),
+        "created_at": task["created_at"],
+        "updated_at": task.get("updated_at"),
+    }
+
+# 0. 登录
+@app.post("/api/auth/login")
+async def login(req: LoginRequest):
+    user = await get_user_by_username(req.username)
+    if not user or user.get("disabled") or not _verify_password(req.password, user["password_hash"]):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误")
+    public = public_user(user)
+    return {
+        "access_token": _create_access_token(user),
+        "token_type": "bearer",
+        "user": public,
+    }
+
+
+@app.get("/api/auth/me")
+async def me(current_user: Annotated[dict, Depends(require_user)]):
+    return current_user
+
+
 # 1. 提交任务
 @app.post("/api/tasks")
-async def create_task(req: TaskRequest):
+async def create_task(req: TaskRequest, current_user: Annotated[dict, Depends(require_user)]):
+    user_id = current_user["id"]
     task_id = str(uuid.uuid4())
-    await save_task(task_id, req.user_id, req.prompt)
-    asyncio.create_task(execute_task(task_id, req.user_id, req.prompt))
+    await save_task(task_id, user_id, req.prompt)
+    asyncio.create_task(execute_task(task_id, user_id, req.prompt))
     return {"task_id": task_id}
 
 # 1.5 回复任务（续写等待用户确认或已有成果的任务）
 @app.post("/api/tasks/{task_id}/reply")
-async def reply_task(task_id: str, req: ReplyRequest):
+async def reply_task(
+    task_id: str,
+    req: ReplyRequest,
+    current_user: Annotated[dict, Depends(require_user)],
+):
     task = await get_task(task_id)
     if not task:
         return {"error": "not found"}
+    if not _can_access_task(current_user, task):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该任务")
     if task["status"] not in ("waiting_user", "ready", "error"):
         return {"error": f"cannot reply, current status: {task['status']}"}
+
+    user_id = current_user["id"]
 
     # 预先初始化 running_tasks 和数据库状态，避免 WebSocket 时序竞争
     existing_events = task.get("events", [])
     running_tasks[task_id] = existing_events.copy()
     await update_task(task_id, status="running")
 
-    asyncio.create_task(execute_task(task_id, req.user_id, req.content, is_continue=True))
+    asyncio.create_task(execute_task(task_id, user_id, req.content, is_continue=True))
     return {"ok": True}
 
 # 1.6 停止正在运行的任务
 @app.post("/api/tasks/{task_id}/stop")
-async def stop_task(task_id: str):
+async def stop_task(
+    task_id: str,
+    current_user: Annotated[dict, Depends(require_user)],
+):
     """终止正在运行的任务"""
+    task = await get_task(task_id)
+    if task and not _can_access_task(current_user, task):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该任务")
     process = running_processes.get(task_id)
     if not process:
         return {"error": "task not running"}
@@ -374,8 +598,14 @@ async def stop_task(task_id: str):
 
 # 1.7 删除任务（数据库记录 + 工作目录）
 @app.delete("/api/tasks/{task_id}")
-async def delete_task_endpoint(task_id: str):
+async def delete_task_endpoint(
+    task_id: str,
+    current_user: Annotated[dict, Depends(require_user)],
+):
     """删除任务记录和工作目录"""
+    task = await get_task(task_id)
+    if task and not _can_access_task(current_user, task):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该任务")
     import sqlite3
     db_path = _DB_PATH
     try:
@@ -597,7 +827,10 @@ def _cleanup_orphan_locks():
 
 
 @app.post("/api/tasks/{task_id}/preview")
-async def start_preview(task_id: str):
+async def start_preview(
+    task_id: str,
+    current_user: Annotated[dict, Depends(require_user)],
+):
     """启动 ppt-master的SVG浏览器预览服务
 
     端口策略：
@@ -608,6 +841,9 @@ async def start_preview(task_id: str):
     回收策略：
     - 全局同时活跃预览数 ≤ MAX_PREVIEWS；超过则按 LRU 杀最久未用的
     """
+    task = await get_task(task_id)
+    if task and not _can_access_task(current_user, task):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该任务")
     project_path = _detect_project_for_preview(task_id)
     if not project_path:
         return {"error": "no ppt project found. Run agent to generate SVG files first."}
@@ -713,8 +949,14 @@ async def start_preview(task_id: str):
 
 
 @app.post("/api/tasks/{task_id}/preview/stop")
-async def stop_preview(task_id: str):
+async def stop_preview(
+    task_id: str,
+    current_user: Annotated[dict, Depends(require_user)],
+):
     """关闭当前任务关联的预览服务（LRU 不会主动杀它）。"""
+    task = await get_task(task_id)
+    if task and not _can_access_task(current_user, task):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该任务")
     project_path = _detect_project_for_preview(task_id)
     if not project_path:
         return {"error": "no ppt project for this task"}
@@ -733,8 +975,14 @@ async def stop_preview(task_id: str):
 
 
 @app.get("/api/tasks/{task_id}/preview/status")
-async def preview_status(task_id: str):
+async def preview_status(
+    task_id: str,
+    current_user: Annotated[dict, Depends(require_user)],
+):
     """查询当前任务的预览是否在跑 + URL（前端用于切按钮文案）。"""
+    task = await get_task(task_id)
+    if task and not _can_access_task(current_user, task):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该任务")
     project_path = _detect_project_for_preview(task_id)
     if not project_path:
         return {"running": False, "reason": "no ppt project"}
@@ -760,13 +1008,21 @@ async def preview_status(task_id: str):
 
 # 1.9 应用 SVG 标注（重新生成 + 触发 agent 应用注解）
 @app.post("/api/tasks/{task_id}/apply-annotations")
-async def apply_annotations(task_id: str, req: ReplyRequest):
+async def apply_annotations(
+    task_id: str,
+    req: ReplyRequest,
+    current_user: Annotated[dict, Depends(require_user)],
+):
     """应用标注并触发 Agent 重新生成"""
     task = await get_task(task_id)
     if not task:
         return {"error": "task not found"}
+    if not _can_access_task(current_user, task):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该任务")
     if task["status"] not in ("waiting_user", "ready"):
         return {"error": f"cannot apply, status: {task['status']}"}
+
+    user_id = current_user["id"]
 
     # 构造一条包含标注应用的回复
     annotation_message = f"## 用户已提交 SVG 预览标注\n\n{req.content}\n\n请应用这些标注并重新生成 PPTX。"
@@ -775,47 +1031,73 @@ async def apply_annotations(task_id: str, req: ReplyRequest):
     running_tasks[task_id] = existing_events.copy()
     await update_task(task_id, status="running")
 
-    asyncio.create_task(execute_task(task_id, req.user_id, annotation_message, is_continue=True))
+    asyncio.create_task(execute_task(task_id, user_id, annotation_message, is_continue=True))
     return {"ok": True}
 
 
 # 2. 获取用户历史任务列表
 @app.get("/api/users/{user_id}/tasks")
-async def list_user_tasks(user_id: str):
+async def list_user_tasks(
+    user_id: str,
+    current_user: Annotated[dict, Depends(require_user)],
+):
+    if current_user and current_user.get("role") != "admin" and current_user.get("id") != user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权查看该用户任务")
     tasks = await get_user_tasks(user_id)
     # 不返回 events 字段（太大），只返回元数据
-    return [
-        {
-            "task_id": t["id"],
-            "prompt": t["prompt"],
-            "status": t["status"],
-            "output_file": t.get("output_file"),
-            "output_files": t.get("output_files"),
-            "created_at": t["created_at"],
-        }
-        for t in tasks
-    ]
+    return [_task_meta(t) for t in tasks]
 
 # 3. 查询单个任务状态
 @app.get("/api/tasks/{task_id}")
-async def get_task_status(task_id: str):
+async def get_task_status(
+    task_id: str,
+    current_user: Annotated[dict, Depends(require_user)],
+):
     task = await get_task(task_id)
     if not task:
         return {"error": "task not found"}
+    if not _can_access_task(current_user, task):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该任务")
     return {
         "task_id": task["id"],
         "status": task["status"],
         "output_file": task.get("output_file"),
         "output_files": task.get("output_files"),
         "error": task.get("error"),
+        "input_tokens": task.get("input_tokens") or 0,
+        "output_tokens": task.get("output_tokens") or 0,
     }
 
 # 4. 下载文件（可指定文件名）
 @app.get("/api/tasks/{task_id}/download")
-async def download_file(task_id: str, filename: str | None = None):
+async def download_file(
+    task_id: str,
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    filename: str | None = None,
+    token: str | None = None,
+):
+    """文件下载：浏览器原生 <a download> 不会带 Authorization header，
+    因此额外接受 ?token= 查询参数作为兜底。其他 task 级接口仍走 Authorization 头。
+    """
+    # 兜底：如果没 Authorization 头，尝试用 query token 解析出用户。
+    if current_user is None and token:
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+            user_id = payload.get("sub")
+            if user_id:
+                user = await get_user_by_id(user_id)
+                if user and not user.get("disabled"):
+                    current_user = public_user(user)
+        except jwt.PyJWTError:
+            pass
+    if current_user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="需要登录")
+
     task = await get_task(task_id)
     if not task:
         return {"error": "task not found"}
+    if not _can_access_task(current_user, task):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该任务")
     if task["status"] not in ("done", "ready"):
         return {"error": f"task not ready, status: {task['status']}"}
 
@@ -847,10 +1129,15 @@ async def download_file(task_id: str, filename: str | None = None):
 
 # 4.5 列出任务的所有下载文件
 @app.get("/api/tasks/{task_id}/files")
-async def list_task_files(task_id: str):
+async def list_task_files(
+    task_id: str,
+    current_user: Annotated[dict, Depends(require_user)],
+):
     task = await get_task(task_id)
     if not task:
         return {"error": "task not found"}
+    if not _can_access_task(current_user, task):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该任务")
 
     output_files = task.get("output_files") or []
     if task.get("output_file") and task["output_file"] not in output_files:
@@ -870,27 +1157,136 @@ async def list_task_files(task_id: str):
 
 # 4.6 获取任务事件历史
 @app.get("/api/tasks/{task_id}/events")
-async def get_task_events(task_id: str):
+async def get_task_events(
+    task_id: str,
+    current_user: Annotated[dict, Depends(require_user)],
+):
     """获取任务的所有历史事件"""
     task = await get_task(task_id)
     if not task:
         return {"error": "task not found"}
+    if not _can_access_task(current_user, task):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该任务")
     return {
         "task_id": task_id,
         "status": task["status"],
         "events": task.get("events", []),
         "output_files": task.get("output_files", []),
+        "input_tokens": task.get("input_tokens") or 0,
+        "output_tokens": task.get("output_tokens") or 0,
     }
+
+# 4.7 管理员 API
+@app.get("/api/admin/users")
+async def admin_list_users(admin: Annotated[dict, Depends(require_admin)]):
+    return await list_users_with_usage()
+
+
+@app.post("/api/admin/users")
+async def admin_create_user(req: CreateUserRequest, admin: Annotated[dict, Depends(require_admin)]):
+    if await get_user_by_username(req.username):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="用户名已存在")
+    user = await create_user(
+        str(uuid.uuid4()),
+        req.username,
+        _hash_password(req.password),
+        role=req.role,
+        display_name=req.display_name,
+    )
+    return public_user(user)
+
+
+@app.patch("/api/admin/users/{user_id}")
+async def admin_update_user(
+    user_id: str,
+    req: UpdateUserRequest,
+    admin: Annotated[dict, Depends(require_admin)],
+):
+    updates = {}
+    if req.password:
+        updates["password_hash"] = _hash_password(req.password)
+    if req.role is not None:
+        updates["role"] = req.role
+    if req.display_name is not None:
+        updates["display_name"] = req.display_name
+    if req.disabled is not None:
+        updates["disabled"] = 1 if req.disabled else 0
+    user = await update_user(user_id, **updates)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+    return public_user(user)
+
+
+@app.delete("/api/admin/users/{user_id}")
+async def admin_disable_user(user_id: str, admin: Annotated[dict, Depends(require_admin)]):
+    if user_id == admin.get("id"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="不能禁用当前管理员")
+    user = await update_user(user_id, disabled=1)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+    return public_user(user)
+
+
+@app.get("/api/admin/users/{user_id}/tasks")
+async def admin_list_user_tasks(user_id: str, admin: Annotated[dict, Depends(require_admin)], limit: int = 100):
+    tasks = await get_user_tasks(user_id, limit=limit)
+    return [_task_meta(t) for t in tasks]
+
+
+@app.get("/api/admin/users/{user_id}/usage")
+async def admin_get_user_usage(user_id: str, admin: Annotated[dict, Depends(require_admin)]):
+    user = await get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+    usage = await get_user_usage(user_id)
+    usage["user"] = public_user(user)
+    return usage
+
+
+@app.get("/api/admin/tasks/{task_id}")
+async def admin_get_task(task_id: str, admin: Annotated[dict, Depends(require_admin)]):
+    task = await get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
+    meta = _task_meta(task)
+    meta["events"] = task.get("events", [])
+    meta["error"] = task.get("error")
+    return meta
+
 
 # 5. WebSocket 实时订阅
 @app.websocket("/ws/tasks/{task_id}")
-async def task_websocket(websocket: WebSocket, task_id: str, offset: int = 0):
-    """offset: 客户端已拥有的事件数，从 offset 开始发送新事件（避免重复）"""
+async def task_websocket(websocket: WebSocket, task_id: str, offset: int = 0, token: str | None = None):
+    """offset: 客户端已拥有的事件数，从 offset 开始发送新事件（避免重复）。
+
+    强制要求登录：query 参数 `token` 必须有效；否则直接拒绝。
+    """
+    current_user = None
+    if token:
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+            user_id = payload.get("sub")
+            if user_id:
+                user = await get_user_by_id(user_id)
+                if user and not user.get("disabled"):
+                    current_user = public_user(user)
+        except jwt.PyJWTError:
+            pass
+
     await websocket.accept()
+
+    if current_user is None:
+        await websocket.send_json({"type": "error", "msg": "unauthorized"})
+        await websocket.close()
+        return
 
     task = await get_task(task_id)
     if not task:
         await websocket.send_json({"type": "error", "msg": "task not found"})
+        await websocket.close()
+        return
+    if not _can_access_task(current_user, task):
+        await websocket.send_json({"type": "error", "msg": "forbidden"})
         await websocket.close()
         return
 
@@ -1018,8 +1414,15 @@ def _resolve_fs_path(task_id: str, path: str) -> tuple[Path | None, Path | None]
     return task_dir, target
 
 @app.get("/api/tasks/{task_id}/fs/tree")
-async def fs_tree(task_id: str, dir: str = ""):
+async def fs_tree(
+    task_id: str,
+    current_user: Annotated[dict, Depends(require_user)],
+    dir: str = "",
+):
     """列出任务项目目录的文件树"""
+    task = await get_task(task_id)
+    if task and not _can_access_task(current_user, task):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该任务")
     task_dir, target = _resolve_fs_path(task_id, dir)
     if not task_dir:
         return {"error": "task directory not found"}
@@ -1054,8 +1457,15 @@ async def fs_tree(task_id: str, dir: str = ""):
 
 
 @app.get("/api/tasks/{task_id}/fs/read")
-async def fs_read(task_id: str, path: str):
+async def fs_read(
+    task_id: str,
+    current_user: Annotated[dict, Depends(require_user)],
+    path: str,
+):
     """读取文件内容"""
+    task = await get_task(task_id)
+    if task and not _can_access_task(current_user, task):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该任务")
     task_dir, file_path = _resolve_fs_path(task_id, path)
     if not task_dir:
         return {"error": "task not found"}
@@ -1082,8 +1492,15 @@ async def fs_read(task_id: str, path: str):
 
 
 @app.post("/api/tasks/{task_id}/fs/write")
-async def fs_write(task_id: str, req: FileWriteRequest):
+async def fs_write(
+    task_id: str,
+    req: FileWriteRequest,
+    current_user: Annotated[dict, Depends(require_user)],
+):
     """写入/编辑文件"""
+    task = await get_task(task_id)
+    if task and not _can_access_task(current_user, task):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该任务")
     task_dir, file_path = _resolve_fs_path(task_id, req.path)
     if not task_dir:
         return {"error": "task not found"}
@@ -1096,8 +1513,18 @@ async def fs_write(task_id: str, req: FileWriteRequest):
 
 
 @app.post("/api/tasks/{task_id}/fs/upload")
-async def fs_upload(task_id: str, path: str = "", file: UploadFile = None):
+async def fs_upload(
+    task_id: str,
+    current_user: Annotated[dict, Depends(require_user)],
+    path: str = "",
+    file: UploadFile = None,
+):
     """上传文件到项目目录"""
+    if current_user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="需要登录")
+    task = await get_task(task_id)
+    if task and not _can_access_task(current_user, task):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该任务")
     task_dir = _get_task_dir(task_id)
     if not task_dir:
         return {"error": "task not found"}

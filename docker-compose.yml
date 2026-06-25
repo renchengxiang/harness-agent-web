@@ -22,6 +22,10 @@ services:
       HARNESS_DB_PATH: /data/harness.db
       # SVG 预览服务在容器里必须 bind 0.0.0.0，否则宿主机端口映射访问不到
       SVG_EDITOR_HOST: 0.0.0.0
+      # JWT 鉴权（>=32 字符；可通过 .env 覆盖）
+      HARNESS_JWT_SECRET: ${HARNESS_JWT_SECRET:?请在 .env 中设置 HARNESS_JWT_SECRET（>=32 字符）}
+      HARNESS_ADMIN_USERNAME: ${HARNESS_ADMIN_USERNAME:-admin}
+      HARNESS_ADMIN_PASSWORD: ${HARNESS_ADMIN_PASSWORD:-admin123}
       # 可选：透传 host 上的 API key 给容器里的 oh
       # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       # OPENAI_API_KEY: ${OPENAI_API_KEY}

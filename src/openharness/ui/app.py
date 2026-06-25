@@ -257,7 +257,12 @@ async def run_print_mode(
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                 elif output_format == "stream-json":
-                    obj = {"type": "assistant_complete", "text": event.message.text.strip()}
+                    obj = {
+                        "type": "assistant_complete",
+                        "text": event.message.text.strip(),
+                        "input_tokens": event.usage.input_tokens,
+                        "output_tokens": event.usage.output_tokens,
+                    }
                     print(json.dumps(obj), flush=True)
                     events_list.append(obj)
             elif isinstance(event, ToolExecutionStarted):

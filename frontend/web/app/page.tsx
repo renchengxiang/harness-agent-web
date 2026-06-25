@@ -2,16 +2,19 @@
 "use client"
 
 import { useState, useCallback, useEffect, useRef } from "react"
+import { useRouter } from "next/navigation"
+import Link from "next/link"
 import { Badge } from "@/components/ui/badge"
-import { Bot, Download, FileText, FolderOpen, ExternalLink, Loader2, X } from "lucide-react"
+import { Bot, Download, FileText, FolderOpen, ExternalLink, Loader2, LogIn, LogOut, Shield, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { PromptForm, ChatMode }    from "@/components/PromptForm"
 import { EventLog }     from "@/components/EventLog"
 import { TaskHistory }  from "@/components/TaskHistory"
 import { FileManager }  from "@/components/FileManager"
+import { useAuth } from "@/lib/auth"
 import {
   createTask, subscribeTask, replyTask, stopTask,
-  getUserId, getDownloadUrl, getTaskEvents,
+  getDownloadUrl, getTaskEvents,
   AgentEvent, DoneEvent, TaskMeta,
 } from "@/lib/api"
 
@@ -23,7 +26,8 @@ type TaskState =
   | { phase: "error";   taskId: string; events: AgentEvent[]; message: string }
 
 export default function Home() {
-  const [userId, setUserId]           = useState<string>("")
+  const router = useRouter()
+  const { user, isAdmin, ready, logout } = useAuth()
   const [task, setTask]               = useState<TaskState>({ phase: "idle" })
   const [refreshTrigger, setRefresh]  = useState(0)
   const [fileManagerOpen, setFileManagerOpen] = useState(false)
@@ -31,9 +35,15 @@ export default function Home() {
   const [previewRunning, setPreviewRunning]   = useState(false)
   const [previewUrl, setPreviewUrl]           = useState<string | null>(null)
 
-  // 客户端获取 userId（避免 SSR 问题）
-  useEffect(() => { setUserId(getUserId()) }, [])
+  // 未登录跳转到 /login
+  useEffect(() => {
+    if (ready && !user) {
+      router.replace("/login")
+    }
+  }, [ready, user, router])
 
+  // userId 在 hooks 顶部统一计算：未登录时为空串，保证后续所有 hooks 顺序稳定。
+  const userId = user?.id ?? ""
   const subscribeCleanupRef = useRef<(() => void) | null>(null)
   const currentTaskId = task.phase !== "idle" ? task.taskId : undefined
 
@@ -418,6 +428,14 @@ export default function Home() {
     return null
   })()
 
+  if (!ready || !user) {
+    return (
+      <div className="flex h-screen items-center justify-center text-sm text-muted-foreground">
+        正在跳转登录…
+      </div>
+    )
+  }
+
   return (
     <>
     <div className="flex h-screen bg-background overflow-hidden">
@@ -444,10 +462,37 @@ export default function Home() {
           />
         )}
 
-        <div className="px-4 py-3 border-t">
-          <p className="text-xs text-muted-foreground">用户 ID</p>
-          <p className="text-xs font-mono text-muted-foreground truncate mt-0.5">
-            {userId.slice(0, 8)}...
+        <div className="px-4 py-3 border-t space-y-2">
+          {user ? (
+            <>
+              <p className="text-xs text-muted-foreground">已登录</p>
+              <p className="text-sm font-medium truncate">{user.display_name || user.username}</p>
+              <p className="text-[11px] text-muted-foreground truncate">角色：{user.role}</p>
+              <div className="flex flex-col gap-1.5 pt-1">
+                {isAdmin && (
+                  <Button asChild size="sm" variant="outline">
+                    <a href="/admin"><Shield className="h-3.5 w-3.5 mr-1" />管理后台</a>
+                  </Button>
+                )}
+                <Button size="sm" variant="ghost" onClick={logout}>
+                  <LogOut className="h-3.5 w-3.5 mr-1" />
+                  退出登录
+                </Button>
+              </div>
+            </>
+          ) : (
+            <>
+              <p className="text-xs text-muted-foreground">未登录</p>
+              <Button asChild size="sm" variant="outline" className="w-full">
+                <a href="/login"><LogIn className="h-3.5 w-3.5 mr-1" />登录</a>
+              </Button>
+              <p className="text-[11px] text-muted-foreground pt-1">
+                当前以匿名身份使用，刷新页面或换设备会丢失会话。
+              </p>
+            </>
+          )}
+          <p className="text-[11px] text-muted-foreground font-mono truncate pt-1">
+            user_id: {userId ? `${userId.slice(0, 12)}…` : "未初始化"}
           </p>
         </div>
       </aside>

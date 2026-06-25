@@ -40,30 +40,36 @@ function eventsToLogs(events: AgentEvent[]): LogItem[] {
     } else if (event.type === "assistant_complete" && event.text.trim()) {
       // 完整的助理消息：尝试与上一条已累积的 delta 合并，避免重复渲染。
       // oh 的 stream-json 里，assistant_complete 经常携带"完整/最终"文本，而
-      // 之前已经有一串 assistant_delta 被合并到了 last.content。两者关系有 4 种：
+      // 之前已经有一串 assistant_delta 被合并到了 last.content。两者的关系：
+      //  1. 严格相等 → 跳过
+      //  2. 仅空白差异 → 跳过（保留 last.content，避免把已经渲染好的文字改成带空白的版本）
+      //  3. text 是 last 的扩展（text 包含 last 全部 + 尾巴） → 用 text 覆盖
+      //  4. last 已经包含 text 全部 → 跳过（delta 已经把完整文本发出去了）
+      //  5. 都没有包含关系 → 视为新一轮回复
       const last = logs[logs.length - 1]
       const text = event.text
       if (last?.type === "assistant") {
-        if (last.content === text) {
-          // 完全相同：complete 只是确认 → 跳过
+        // 用 trim() 处理两端空白，避免 oh 偶尔给 complete 文本带前后空格时被误判为新条目。
+        const lastTrim = last.content.trim()
+        const textTrim = text.trim()
+        if (lastTrim === textTrim) {
+          // 1：完全相同（忽略空白） → 跳过，不动 last.content
           continue
         }
-        const lastTrim = last.content.trimEnd()
-        if (lastTrim === text.trimEnd()) {
-          // 仅尾部空白不同
+        if (textTrim.startsWith(lastTrim) && textTrim.length > lastTrim.length) {
+          // 2：text 是 last 的扩展 → 用 text 覆盖（保留 oh 给的最终文本形态）
           last.content = text
           continue
         }
-        if (text.startsWith(lastTrim)) {
-          // text 包含 last 的全部内容 + 尾巴（complete 把之前漏发的 token 补全了）
-          last.content = text
+        if (lastTrim.startsWith(textTrim) && lastTrim.length > textTrim.length) {
+          // 3：last 已经包含 text 全部 → 跳过
           continue
         }
-        if (lastTrim.startsWith(text.trimEnd())) {
-          // last 已经包含了 text 的全部（delta 流式发送时把完整文本发出去了）
+        if (lastTrim.endsWith(textTrim) && lastTrim.length > textTrim.length) {
+          // 4：text 是 last 末尾的一段（同 turn 的最后一段 delta/complete）→ 跳过
           continue
         }
-        // 完全不同（可能是新一轮回复开始、或上一条其实是不同 step）→ 新建一条
+        // 5：关系不明确 → 新建一条（宁多勿漏）
       }
       logs.push({ id, type: "assistant", content: text })
     } else if (event.type === "tool_started") {
